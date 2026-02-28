@@ -58,6 +58,26 @@ from src.models.functional.cauchy import cauchy_naive
 from src.models.functional.vandermonde import log_vandermonde_naive
 from src.models.functional.vandermonde import log_vandermonde_transpose_naive
 
+# Try to import fused SSM CUDA kernel (same way as ss4d_frac_manual.py)
+try:
+    import sys
+    import os
+    # Navigate from src/models/sequence/kernels/ssm.py to project root, then to cuda_ops
+    # __file__ -> kernels -> sequence -> models -> src -> project_root
+    cuda_ops_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))), 'cuda_ops')
+    if cuda_ops_path not in sys.path:
+        sys.path.insert(0, cuda_ops_path)
+    from fused_ssm import fused_ssm_forward, is_cuda_available
+    CUDA_AVAILABLE = is_cuda_available()
+    if CUDA_AVAILABLE:
+        log.info("Fused SSM CUDA kernel found and loaded successfully.")
+    else:
+        log.warning("Fused SSM CUDA kernel not available, will use fallback implementation.")
+except Exception as e:
+    log.warning(f"Failed to import fused SSM CUDA kernel: {e}. Using fallback implementation.")
+    CUDA_AVAILABLE = False
+    fused_ssm_forward = None
+
 # Base Kernel class
 from src.models.sequence.kernels.kernel import Kernel
 
@@ -567,6 +587,12 @@ class SSMKernelDiag(SSMKernel):
         return dt, A, B, C
 
     def forward(self, L, state=None, rate=1.0):
+        """Compute fractional SSM convolution kernel using vectorized implementation.
+        
+        Returns:
+            K: (C, H, L) convolution kernel
+            K_state: (B, C, H, L) or None, state-dependent kernel
+        """
         """See Kernel.forward() for argument documentation."""
 
         dt, A, B, C = self._get_params(rate)
@@ -697,8 +723,6 @@ class SSMKernelFrac(SSMKernel):
         manual_omega: Optional[torch.Tensor] = None,
         manual_eta: Optional[torch.Tensor] = None,
         learnable_omega_eta: bool = True,
-        # Use loop-based implementation (memory efficient)
-        use_loop: bool = False,
         # Constraints for learnable omega/eta (for numerical stability)
         omega_min: float = 1e-6,
         omega_max: float = 100.0,
@@ -730,7 +754,6 @@ class SSMKernelFrac(SSMKernel):
 
         # Manual / learnable omega, eta configuration
         self.learnable_omega_eta = learnable_omega_eta
-        self.use_loop = use_loop
         self.omega_min = omega_min
         self.omega_max = omega_max
         self.eta_min = eta_min
@@ -780,8 +803,8 @@ class SSMKernelFrac(SSMKernel):
                 default_omega = torch.zeros(1)
                 default_eta = torch.ones(1)
             elif self.frac_M == 2:
-                default_omega = torch.tensor([0.0, 0.1])  # Smaller omega_2 for slower decay
-                default_eta = torch.tensor([1.0, 0.1])   # First term dominates
+                default_omega = torch.tensor([0.0, 1.0])  # Smaller omega_2 for slower decay
+                default_eta = torch.tensor([0.9, 0.1])   # First term dominates
             else:
                 # M>=3: extend with more terms
                 # Default: evenly spaced omega from 0 to 0.1, uniform eta
@@ -905,7 +928,7 @@ class SSMKernelFrac(SSMKernel):
             eta = self.eta.to(device).to(base_dtype)      # (M,)
 
         # Normalize eta to ensure sum(eta_i) = 1
-        #eta = eta / (eta.sum() + 1e-8)  # (M,)
+        eta = eta / (eta.sum() + 1e-8)  # (M,)
 
         # Broadcast omega and eta to match A, C shapes
         A_exp = A.unsqueeze(1).expand(H, M, N_state)      # (H, M, N_state)
@@ -937,21 +960,12 @@ class SSMKernelFrac(SSMKernel):
         return dt, A_frac, B_frac, C_frac
     
     def forward(self, L, state=None, rate=1.0):
-        """Compute fractional SSM convolution kernel.
+        """Compute fractional SSM convolution kernel using vectorized implementation.
         
         Returns:
             K: (C, H, L) convolution kernel
             K_state: (B, C, H, L) or None, state-dependent kernel
         """
-        if self.use_loop:
-            # Loop-based implementation (memory efficient)
-            return self._forward_loop(L, state, rate)
-        else:
-            # Vectorized implementation (default)
-            return self._forward_vectorized(L, state, rate)
-    
-    def _forward_vectorized(self, L, state=None, rate=1.0):
-        """Vectorized implementation using Vandermonde kernel."""
         dt, A, B, C = self._get_params(rate, L)
         # dt: (H, 1) or (H, N) -> need to expand to (H, M*N_state)
         # A: (H, M*N_state) where M*N_state = frac_M * N
@@ -970,12 +984,20 @@ class SSMKernelFrac(SSMKernel):
         
         # Augment B with state
         if state is not None:
-            # State needs to be augmented to match M*N_state dimension
-            # For now, we'll repeat the state M times
-            state_frac = state.unsqueeze(2).expand(state.shape[0], state.shape[1], self.frac_M, state.shape[2])
-            state_frac = state_frac.reshape(state.shape[0], state.shape[1], -1)  # (B, H, M*N_state)
+            # state should already be (B, H, M*N) from default_state
+            assert state.shape[-1] == self.N * self.frac_M, \
+                f"State dimension mismatch: got {state.shape[-1]}, expected {self.N * self.frac_M}"
             
-            s = state_frac / dt.unsqueeze(-1)
+            # Expand dt to match state dimension (H, M*N)
+            if dt.dim() == 2 and dt.shape[-1] == 1:
+                dt_for_state = dt.expand(-1, self.N * self.frac_M)  # (H, M*N)
+            elif dt.shape[-1] == self.N:
+                # dt: (H, N) -> repeat M times to get (H, M*N)
+                dt_for_state = dt.unsqueeze(1).expand(-1, self.frac_M, -1).reshape(self.H, -1)
+            else:
+                dt_for_state = dt  # Already (H, M*N)
+            
+            s = state / dt_for_state.unsqueeze(0)  # (B, H, M*N) / (1, H, M*N)
             if self.disc == 'bilinear':
                 s = s * (1. + dtA/2)
             elif self.disc == 'zoh':
@@ -1060,19 +1082,38 @@ class SSMKernelFrac(SSMKernel):
                     can_use_vandermonde = False
             
             if not can_use_vandermonde:
-                # Direct computation: K = C_disc * exp(dtA * t) for t = 0, 1, ..., L-1
-                # Use real dtype for arange since it doesn't support complex
-                base_dtype = A.real.dtype if A.is_complex() else A.dtype
-                K = dtA_clipped.unsqueeze(-1) * torch.arange(L, device=A.device, dtype=base_dtype)  # (H, M*N_state, L)
-                # Clip K (handle complex numbers)
-                if K.is_complex():
-                    K_real_clipped = torch.clamp(K.real, min=-50.0, max=50.0)
-                    K_clipped = K_real_clipped + 1j * K.imag
-                else:
-                    K_clipped = torch.clamp(K, min=-50.0, max=50.0)
-                exp_K = torch.exp(K_clipped)  # (H, M*N_state, L)
+                # Try to use our fused SSM CUDA kernel (same as ss4d_frac_manual.py)
+                use_cuda = CUDA_AVAILABLE and dtA_clipped.device.type == 'cuda' and self.backend == 'cuda'
                 
-                K = 2 * contract('chn, hnl -> chl', C_disc, exp_K).real  # (C, H, L)
+                if use_cuda:
+                    try:
+                        # C_disc shape: (1+B*C_channels, H, M*N_state)
+                        # fused_ssm_forward expects: (C, H, M*N_state)
+                        # We need to process each batch separately
+                        K_list = []
+                        for batch_idx in range(C_disc.shape[0]):
+                            K_batch = fused_ssm_forward(dtA_clipped, C_disc[batch_idx:batch_idx+1], L)  # (1, H, L)
+                            K_list.append(K_batch)
+                        K = torch.cat(K_list, dim=0)  # (1+B*C_channels, H, L)
+                        use_cuda = True  # Success
+                    except Exception as e:
+                        log.debug(f"Fused SSM CUDA kernel failed, falling back to direct computation: {e}")
+                        use_cuda = False
+                
+                if not use_cuda:
+                    # Direct computation: K = C_disc * exp(dtA * t) for t = 0, 1, ..., L-1
+                    # Use real dtype for arange since it doesn't support complex
+                    base_dtype = A.real.dtype if A.is_complex() else A.dtype
+                    K = dtA_clipped.unsqueeze(-1) * torch.arange(L, device=A.device, dtype=base_dtype)  # (H, M*N_state, L)
+                    # Clip K (handle complex numbers)
+                    if K.is_complex():
+                        K_real_clipped = torch.clamp(K.real, min=-50.0, max=50.0)
+                        K_clipped = K_real_clipped + 1j * K.imag
+                    else:
+                        K_clipped = torch.clamp(K, min=-50.0, max=50.0)
+                    exp_K = torch.exp(K_clipped)  # (H, M*N_state, L)
+                    
+                    K = 2 * contract('chn, hnl -> chl', C_disc, exp_K).real  # (C, H, L)
             
         elif self.disc == 'bilinear':
             dA = (1. + dtA/2) / (1. - dtA/2 + 1e-8)
@@ -1111,20 +1152,41 @@ class SSMKernelFrac(SSMKernel):
                     can_use_vandermonde = False
             
             if not can_use_vandermonde:
-                # Direct computation for bilinear
-                log_dA = dA.log()
-                # Use real dtype for arange since it doesn't support complex
-                base_dtype = A.real.dtype if A.is_complex() else A.dtype
-                K = log_dA.unsqueeze(-1) * torch.arange(L, device=A.device, dtype=base_dtype)  # (H, M*N_state, L)
-                # Clip K (handle complex numbers)
-                if K.is_complex():
-                    K_real_clipped = torch.clamp(K.real, min=-50.0, max=50.0)
-                    K_clipped = K_real_clipped + 1j * K.imag
-                else:
-                    K_clipped = torch.clamp(K, min=-50.0, max=50.0)
-                exp_K = torch.exp(K_clipped)
+                # Try to use our fused SSM CUDA kernel (same as ss4d_frac_manual.py)
+                use_cuda = CUDA_AVAILABLE and dA.device.type == 'cuda' and self.backend == 'cuda'
                 
-                K = 2 * contract('chn, hnl -> chl', C_disc, exp_K).real  # (C, H, L)
+                if use_cuda:
+                    try:
+                        # For bilinear, use log_dA
+                        log_dA = dA.log()
+                        # C_disc shape: (1+B*C_channels, H, M*N_state)
+                        # fused_ssm_forward expects: (C, H, M*N_state)
+                        # We need to process each batch separately
+                        K_list = []
+                        for batch_idx in range(C_disc.shape[0]):
+                            K_batch = fused_ssm_forward(log_dA, C_disc[batch_idx:batch_idx+1], L)  # (1, H, L)
+                            K_list.append(K_batch)
+                        K = torch.cat(K_list, dim=0)  # (1+B*C_channels, H, L)
+                        use_cuda = True  # Success
+                    except Exception as e:
+                        log.debug(f"Fused SSM CUDA kernel failed for bilinear, falling back to direct computation: {e}")
+                        use_cuda = False
+                
+                if not use_cuda:
+                    # Direct computation for bilinear
+                    log_dA = dA.log()
+                    # Use real dtype for arange since it doesn't support complex
+                    base_dtype = A.real.dtype if A.is_complex() else A.dtype
+                    K = log_dA.unsqueeze(-1) * torch.arange(L, device=A.device, dtype=base_dtype)  # (H, M*N_state, L)
+                    # Clip K (handle complex numbers)
+                    if K.is_complex():
+                        K_real_clipped = torch.clamp(K.real, min=-50.0, max=50.0)
+                        K_clipped = K_real_clipped + 1j * K.imag
+                    else:
+                        K_clipped = torch.clamp(K, min=-50.0, max=50.0)
+                    exp_K = torch.exp(K_clipped)
+                    
+                    K = 2 * contract('chn, hnl -> chl', C_disc, exp_K).real  # (C, H, L)
         else:
             raise ValueError(f"Discretization {self.disc} not supported for fractional SSM")
         
@@ -1138,157 +1200,7 @@ class SSMKernelFrac(SSMKernel):
         
         return K, K_state
     
-    def _forward_loop(self, L, state=None, rate=1.0):
-        """Loop-based implementation (memory efficient) for fractional SSM kernel.
-        
-        This implementation computes each M term separately and accumulates,
-        similar to ss4d_frac_manual.py's S4DKernel.
-        """
-        # Get base parameters (without fractional augmentation)
-        if self.is_real:
-            A_base = -param_transform(self.A_real, self.real_transform)
-            B_base = self.B  # (1, S, N)
-            C_base = self.C  # (C, H, N)
-        else:
-            A_base = -param_transform(self.A_real, self.real_transform) - 1j * param_transform(self.A_imag, self.imag_transform)
-            B_base = _r2c(self.B)  # (1, S, N)
-            C_base = _r2c(self.C)  # (C, H, N)
-        
-        if self.dt_fast:
-            inv_dt = torch.sinh(self.inv_dt)
-        else:
-            inv_dt = self.inv_dt
-        dt = param_transform(inv_dt, self.dt_transform) * rate  # (H, N) or (H, 1)
-        
-        if self.bandlimit is not None:
-            freqs = dt / rate * A_base.imag.abs() / (2*math.pi)
-            mask = torch.where(freqs < self.bandlimit * 0.5, 1, 0)
-            C_base = C_base * mask
-        
-        # Broadcast to H dimension
-        A_base = repeat(A_base, 't n -> (v t) n', v=self.repeat)  # (H, N)
-        B_base = repeat(B_base, 'b t n -> b (v t) n', v=self.repeat)  # (1, H, N)
-        
-        # Get omega and eta
-        device = A_base.device
-        base_dtype = A_base.real.dtype if A_base.is_complex() else A_base.dtype
-        
-        if self.learnable_omega_eta:
-            omega_normalized = torch.sigmoid(self.omega_logit)  # (M,) in [0, 1]
-            if self.omega_max > self.omega_min:
-                omega = self.omega_min + omega_normalized * (self.omega_max - self.omega_min)  # (M,)
-            else:
-                omega = torch.full_like(omega_normalized, self.omega_min)  # (M,)
-            
-            eta_normalized = torch.sigmoid(self.eta_logit)  # (M,) in [0, 1]
-            if self.eta_max > self.eta_min:
-                eta = self.eta_min + eta_normalized * (self.eta_max - self.eta_min)  # (M,)
-            else:
-                eta = torch.full_like(eta_normalized, self.eta_min)  # (M,)
-        else:
-            omega = self.omega.to(device).to(base_dtype)  # (M,)
-            eta = self.eta.to(device).to(base_dtype)      # (M,)
-        
-        # Normalize eta
-        eta = eta / (eta.sum() + 1e-8)  # (M,)
-        
-        H, N_state = A_base.shape
-        C_channels = C_base.shape[0]
-        M = self.frac_M
-        
-        # Initialize output kernel
-        K_total = torch.zeros(C_channels, H, L, dtype=base_dtype, device=device)  # (C, H, L)
-        
-        # Process each M term separately
-        for i in range(M):
-            omega_i = omega[i]  # scalar
-            eta_i = eta[i]      # scalar
-            
-            # Compute A_frac_i = -omega_i + eta_i * A_base
-            A_frac_i = -omega_i + eta_i * A_base  # (H, N_state)
-            
-            # Compute C_frac_i = eta_i * C_base
-            C_frac_i = eta_i * C_base  # (C, H, N_state)
-            
-            # Discretize
-            if dt.dim() == 2 and dt.shape[-1] == 1:
-                dt_expanded = dt.expand(-1, N_state)  # (H, N_state)
-            else:
-                dt_expanded = dt  # (H, N_state)
-            
-            dtA_i = A_frac_i * dt_expanded  # (H, N_state)
-            
-            if self.disc == 'zoh':
-                # Handle numerical stability
-                if dtA_i.is_complex():
-                    dtA_i_real_clipped = torch.clamp(dtA_i.real, min=-50.0, max=50.0)
-                    dtA_i_clipped = dtA_i_real_clipped + 1j * dtA_i.imag
-                else:
-                    dtA_i_clipped = torch.clamp(dtA_i, min=-50.0, max=50.0)
-                
-                exp_dtA_i = torch.exp(dtA_i_clipped)  # (H, N_state)
-                
-                # Handle A_frac_i ≈ 0 case
-                small_mask_i = torch.abs(A_frac_i) < 1e-6
-                C_disc_i = C_frac_i * (exp_dtA_i.unsqueeze(0) - 1.0) / (A_frac_i.unsqueeze(0) + 1e-8)  # (C, H, N_state)
-                if small_mask_i.any():
-                    dt_expanded_for_C = dt_expanded.unsqueeze(0).expand(C_channels, H, N_state)
-                    C_disc_small_i = C_frac_i * dt_expanded_for_C
-                    C_disc_i = torch.where(small_mask_i.unsqueeze(0), C_disc_small_i, C_disc_i)
-                
-                # Compute kernel contribution for this term
-                K_i = dtA_i_clipped.unsqueeze(-1) * torch.arange(L, device=device, dtype=base_dtype)  # (H, N_state, L)
-                if K_i.is_complex():
-                    K_i_real_clipped = torch.clamp(K_i.real, min=-50.0, max=50.0)
-                    K_i_clipped = K_i_real_clipped + 1j * K_i.imag
-                else:
-                    K_i_clipped = torch.clamp(K_i, min=-50.0, max=50.0)
-                exp_K_i = torch.exp(K_i_clipped)  # (H, N_state, L)
-                
-                # Accumulate contribution
-                K_i_contribution = 2 * contract('chn, hnl -> chl', C_disc_i, exp_K_i).real  # (C, H, L)
-                K_total = K_total + K_i_contribution
-                
-                # Release memory
-                del K_i, exp_K_i, C_disc_i, dtA_i, A_frac_i, C_frac_i, exp_dtA_i
-            elif self.disc == 'bilinear':
-                # Bilinear discretization
-                dA_i = (1. + dtA_i/2) / (1. - dtA_i/2 + 1e-8)  # (H, N_state)
-                log_dA_i = dA_i.log()  # (H, N_state)
-                
-                # C_disc for bilinear
-                C_disc_i = C_frac_i * (1. - dtA_i.unsqueeze(0)/2).reciprocal() * dt_expanded.unsqueeze(0)  # (C, H, N_state)
-                
-                # Compute kernel contribution for this term
-                K_i = log_dA_i.unsqueeze(-1) * torch.arange(L, device=device, dtype=base_dtype)  # (H, N_state, L)
-                if K_i.is_complex():
-                    K_i_real_clipped = torch.clamp(K_i.real, min=-50.0, max=50.0)
-                    K_i_clipped = K_i_real_clipped + 1j * K_i.imag
-                else:
-                    K_i_clipped = torch.clamp(K_i, min=-50.0, max=50.0)
-                exp_K_i = torch.exp(K_i_clipped)  # (H, N_state, L)
-                
-                # Accumulate contribution
-                K_i_contribution = 2 * contract('chn, hnl -> chl', C_disc_i, exp_K_i).real  # (C, H, L)
-                K_total = K_total + K_i_contribution
-                
-                # Release memory
-                del K_i, exp_K_i, C_disc_i, dtA_i, A_frac_i, C_frac_i, dA_i, log_dA_i
-            else:
-                raise ValueError(f"Discretization {self.disc} not supported for loop-based fractional SSM")
-        
-        K = K_total  # (C, H, L)
-        
-        # Handle state if provided
-        if state is not None:
-            # For loop implementation, state handling is more complex
-            # For now, return None for K_state (can be enhanced if needed)
-            K_state = None
-        else:
-            K_state = None
-        
-        return K, K_state
-    
+
     def _setup_step(self):
         """Set up dA, dB, dC discretized parameters for stepping."""
         # For _setup_step, we use a default L since we don't have sequence length context
@@ -1362,15 +1274,16 @@ class SSMKernelFrac(SSMKernel):
         """Pass the state forward through an entire sequence."""
         self._setup_step()
         AL = self.dA ** u.size(-1)  # (H, M*N_state)
-        
-        # For fractional SSM, we use direct computation
         u = u.flip(-1).to(self.dA).contiguous()  # (B, H, L)
-        v = torch.zeros_like(state)  # (B, H, M*N_state)
         
-        # Compute v = sum_{k=0}^{L-1} dA^k * dB * u[L-1-k]
-        for k in range(u.size(-1)):
-            v = v + contract("h n, b h -> b h n", self.dB, u[:, :, k]) * (self.dA ** k)
+        # Use Vandermonde transpose method (same as SSMKernelDiag)
+        # This is much faster than the naive loop implementation
+        if has_pykeops and self.backend in ['cuda', 'keops']:
+            log_vandermonde_transpose = log_vandermonde_transpose_keops
+        else:
+            log_vandermonde_transpose = log_vandermonde_transpose_naive
         
+        v = log_vandermonde_transpose(u, self.dB, self.dA.log(), u.size(-1))
         next_state = AL * state + v
         return next_state
 
