@@ -4,11 +4,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Optional, List, Tuple
+import sys
+import os
 
 from src.models.nn import DropoutNd
 from src.models.spike.neuron import registry
 from src.models.spike.surrogate import piecewise_quadratic_surrogate
 from src.models.sequence.kernels.ssm import SSMKernelDiag, SSMKernelFrac
+
+# Try to import CUDA optimization
+try:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    cuda_ops_path = os.path.join(current_dir, '../../cuda_ops')
+    if os.path.exists(cuda_ops_path):
+        sys.path.insert(0, cuda_ops_path)
+        from fused_ssm import fused_ssm_forward, is_cuda_available
+        CUDA_AVAILABLE = is_cuda_available()
+        print(f"[S4D] CUDA optimization loaded: {CUDA_AVAILABLE}")
+    else:
+        CUDA_AVAILABLE = False
+        print("[S4D] CUDA optimization path not found, using PyTorch implementation")
+except Exception as e:
+    CUDA_AVAILABLE = False
+    print(f"[S4D] CUDA optimization loading failed: {e}, using PyTorch implementation")
 
 
 class LoongSpikeKernel(nn.Module):
@@ -28,8 +46,6 @@ class LoongSpikeKernel(nn.Module):
         manual_eta: Optional[torch.Tensor] = None,
         # Whether to make omega_i and eta_i learnable
         learnable_omega_eta: bool = True,
-        # Use loop-based implementation (memory efficient)
-        use_loop: bool = False,
         # Constraints for learnable parameters (for numerical stability)
         omega_min: float = 1e-6,
         omega_max: float = 100.0,
@@ -49,7 +65,6 @@ class LoongSpikeKernel(nn.Module):
         
         self.N = N
         self.frac_M = frac_M
-        self.use_loop = use_loop
         self.learnable_omega_eta = learnable_omega_eta
         # Store constraints for learnable parameters
         self.omega_min = omega_min
@@ -113,8 +128,8 @@ class LoongSpikeKernel(nn.Module):
                 default_omega = torch.zeros(1)
                 default_eta = torch.ones(1)
             elif frac_M == 2:
-                default_omega = torch.tensor([0.0, 0.1])  # Smaller omega_2 for slower decay
-                default_eta = torch.tensor([1.0, 0.1])   # First term dominates
+                default_omega = torch.tensor([0.0, 0.3])  # Smaller omega_2 for slower decay
+                default_eta = torch.tensor([0.7, 0.3])   # First term dominates
             else:
                 # M>=3: extend with more terms
                 # Default: evenly spaced omega from 0 to 0.1, uniform eta
@@ -176,82 +191,53 @@ class LoongSpikeKernel(nn.Module):
             omega = self.omega.to(device).to(base_dtype)  # (M,)
             eta = self.eta.to(device).to(base_dtype)  # (M,)
         
-        # Normalize eta to ensure sum(eta_i) = 1
-        #eta = eta / (eta.sum() + 1e-8)  # (M,)
+        # Do not normalize eta to maintain accuracy of SOE theory approximation
+        # eta = eta / (eta.sum() + 1e-8)  # (M,) - commented out
         
-        if self.use_loop:
-            K_total = torch.zeros(C_channels, H, L, dtype=base_dtype, device=device)  # (C, H, L)
-            
-            for i in range(M):
-                # Get omega_i and eta_i for the i-th term (scalars, will broadcast)
-                omega_i = omega[i]  # scalar
-                eta_i = eta[i]  # scalar
-                
-                # Compute A_frac_i = -omega_i + eta_i * A
-                # omega_i and eta_i are scalars, PyTorch will broadcast to (H, N_state)
-                A_frac_i = -omega_i + eta_i * A  # (H, N_state)
-                
-                # Compute C_frac_i = eta_i * C
-                C_frac_i = eta_i * C  # (C, H, N_state)
-                
-                # Discretize
-                dtA_i = A_frac_i * dt.unsqueeze(-1)  # (H, N_state)
-                exp_dtA_i = torch.exp(dtA_i)  # (H, N_state)
-                
-                # Handle A_frac_i ≈ 0 case
-                small_mask_i = torch.abs(A_frac_i) < 1e-6
-                C_disc_i = C_frac_i * (exp_dtA_i - 1.0) / (A_frac_i + 1e-8)  # (C, H, N_state)
-                if small_mask_i.any():
-                    dt_expanded_i = dt.unsqueeze(-1).unsqueeze(0).expand(C_channels, H, N_state)
-                    C_disc_small_i = C_frac_i * dt_expanded_i
-                    C_disc_i = torch.where(small_mask_i.unsqueeze(0), C_disc_small_i, C_disc_i)
-                
-                # Compute convolution kernel contribution for the i-th term
-                K_i = dtA_i.unsqueeze(-1) * torch.arange(L, device=device, dtype=base_dtype)  # (H, N_state, L)
-                exp_K_i = torch.exp(K_i)  # (H, N_state, L)
-                
-                # Accumulate contribution
-                K_i_contribution = 2 * torch.einsum("chn, hnl -> chl", C_disc_i, exp_K_i).real  # (C, H, L)
-                K_total = K_total + K_i_contribution
-                
-                # Release memory (important for memory efficiency)
-                del K_i, exp_K_i, C_disc_i, dtA_i, A_frac_i, C_frac_i, exp_dtA_i
-            
-            K = K_total
+        # ============================================================
+        # Unified use of Vectorized + CUDA optimization
+        # ============================================================
+        # Vectorized implementation: omega and eta are (M,), need to broadcast
+        A_exp = A.unsqueeze(1).expand(H, M, N_state)  # (H, M, N_state)
+        omega_exp = omega.unsqueeze(0).unsqueeze(-1)  # (1, M, 1) -> broadcasts to (H, M, 1)
+        eta_exp = eta.unsqueeze(0).unsqueeze(-1)  # (1, M, 1) -> broadcasts to (H, M, 1)
+        
+        # Compute A_frac = -omega + eta * A
+        A_frac = -omega_exp + eta_exp * A_exp  # (H, M, N_state)
+        
+        # Compute C_frac = eta * C
+        C_exp = C.unsqueeze(2).expand(C_channels, H, M, N_state)  # (C, H, M, N_state)
+        C_frac = eta_exp.unsqueeze(0) * C_exp  # (1, H, M, 1) * (C, H, M, N_state) -> (C, H, M, N_state)
+        
+        # Reshape to (H, M*N_state) and (C, H, M*N_state)
+        A_frac = A_frac.reshape(H, M * N_state)  # (H, M*N_state)
+        C_frac = C_frac.reshape(C_channels, H, M * N_state)  # (C, H, M*N_state)
+        
+        # Discretize
+        dtA = A_frac * dt.unsqueeze(-1)  # (H, M*N_state)
+        exp_dtA = torch.exp(dtA)  # (H, M*N_state)
+        
+        # Handle A_frac ≈ 0 case
+        small_mask = torch.abs(A_frac) < 1e-6
+        C_disc = C_frac * (exp_dtA.unsqueeze(0) - 1.0) / (A_frac.unsqueeze(0) + 1e-8)  # (C, H, M*N_state)
+        if small_mask.any():
+            dt_expanded = dt.unsqueeze(-1).unsqueeze(0).expand(C_channels, H, A_frac.shape[-1])
+            C_disc_small = C_frac * dt_expanded
+            C_disc = torch.where(small_mask.unsqueeze(0), C_disc_small, C_disc)
+        
+        # Use CUDA optimization (if available)
+        use_cuda = CUDA_AVAILABLE and device.type == 'cuda'
+        
+        if use_cuda:
+            # CUDA optimization: call fused kernel
+            K = fused_ssm_forward(dtA, C_disc, L)
         else:
-            # Vectorized implementation: omega and eta are (M,), need to broadcast
-            A_exp = A.unsqueeze(1).expand(H, M, N_state)  # (H, M, N_state)
-            omega_exp = omega.unsqueeze(0).unsqueeze(-1)  # (1, M, 1) -> broadcasts to (H, M, 1)
-            eta_exp = eta.unsqueeze(0).unsqueeze(-1)  # (1, M, 1) -> broadcasts to (H, M, 1)
-            
-            # Compute A_frac = -omega + eta * A
-            A_frac = -omega_exp + eta_exp * A_exp  # (H, M, N_state)
-            
-            # Compute C_frac = eta * C
-            C_exp = C.unsqueeze(2).expand(C_channels, H, M, N_state)  # (C, H, M, N_state)
-            C_frac = eta_exp.unsqueeze(0) * C_exp  # (1, H, M, 1) * (C, H, M, N_state) -> (C, H, M, N_state)
-            
-            # Reshape
-            A_frac = A_frac.reshape(H, M * N_state)  # (H, M*N_state)
-            C_frac = C_frac.reshape(C_channels, H, M * N_state)  # (C, H, M*N_state)
-            
-            # Compute convolution kernel
-            dtA = A_frac * dt.unsqueeze(-1)  # (H, M*N_state)
-            exp_dtA = torch.exp(dtA)  # (H, M*N_state)
-            
-            # Handle A_frac ≈ 0 case
-            small_mask = torch.abs(A_frac) < 1e-6
-            C_disc = C_frac * (exp_dtA.unsqueeze(0) - 1.0) / (A_frac.unsqueeze(0) + 1e-8)  # (C, H, M*N_state)
-            if small_mask.any():
-                dt_expanded = dt.unsqueeze(-1).unsqueeze(0).expand(C_channels, H, A_frac.shape[-1])
-                C_disc_small = C_frac * dt_expanded
-                C_disc = torch.where(small_mask.unsqueeze(0), C_disc_small, C_disc)
-            
+            # PyTorch fallback
             K_all = dtA.unsqueeze(-1) * torch.arange(L, device=device, dtype=base_dtype)  # (H, M*N_state, L)
             exp_K_all = torch.exp(K_all)  # (H, M*N_state, L)
             K = 2 * torch.einsum("chn, hnl -> chl", C_disc, exp_K_all).real  # (C, H, L)
             
-            del exp_K_all, C_disc, dtA, A_frac, C_frac, exp_dtA
+            del exp_K_all
         
         return K, None
     
@@ -386,12 +372,12 @@ class LoongSpikingSSM(nn.Module):
         # for dataset adaptability
         self.d_model = self.d_output = d_model
         
-        # Stack LoongSpike layers as residual blocks
-        self.loongspike_layers = nn.ModuleList()
+        # Stack S4 layers as residual blocks
+        self.s4_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.dropouts = nn.ModuleList()
         for _ in range(n_layers):
-            self.loongspike_layers.append(LoongSpike(d_model, dropout=dropout, transposed=True, **layer))
+            self.s4_layers.append(LoongSpike(d_model, dropout=dropout, transposed=True, **layer))
             if norm == "batch":
                 self.norms.append(nn.BatchNorm1d(d_model))
             elif norm == "layer":
@@ -403,16 +389,16 @@ class LoongSpikingSSM(nn.Module):
         Input x is shape (B, L, d_input)
         """
         x = x.transpose(-1, -2)  # (B, L, d_model) -> (B, d_model, L)
-        for layer, norm, dropout in zip(self.loongspike_layers, self.norms, self.dropouts):
+        for layer, norm, dropout in zip(self.s4_layers, self.norms, self.dropouts):
             z = x
             # Prenorm
             if self.prenorm:
                 z = norm(z) if self.norm == "batch" else norm(z.transpose(-1, -2)).transpose(-1, -2)
             
-            # Apply LoongSpike block
+            # Apply S4 block
             z, _ = layer(z)
             
-            # Dropout on the output of the LoongSpike block
+            # Dropout on the output of the S4 block
             z = dropout(z)
             
             # Residual connection
@@ -425,4 +411,3 @@ class LoongSpikingSSM(nn.Module):
         x = x.transpose(-1, -2)
         
         return x, None
-
