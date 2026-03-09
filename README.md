@@ -35,6 +35,10 @@ conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvi
 
 # Install dependencies
 pip install -r requirements.txt
+
+# CUDA (optional)
+cd cuda_ops
+python setup.py install
 ```
 
 ---
@@ -139,4 +143,3 @@ This project is licensed under the **Apache License 2.0**. See [LICENSE](LICENSE
 Portions of this code are derived from:
 - **S4** (Apache License 2.0) - See [LICENSE-APACHE](LICENSE-APACHE)
 - **SpikingSSMs** (MIT License) - See [LICENSE-MIT](LICENSE-MIT)
-
