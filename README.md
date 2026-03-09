@@ -35,10 +35,6 @@ conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvi
 
 # Install dependencies
 pip install -r requirements.txt
-
-# CUDA (optional)
-cd cuda_ops
-python setup.py install
 ```
 
 ---
