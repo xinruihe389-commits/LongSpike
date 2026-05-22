@@ -1,4 +1,4 @@
-# LoongSpike: Fractional-Order Spiking State Space Models
+# LongSpike: Fractional-Order Spiking State Space Models
 
 Efficient long sequence modeling with fractional-order spiking neural networks.
 
@@ -6,7 +6,7 @@ Efficient long sequence modeling with fractional-order spiking neural networks.
 
 ## Overview
 
-**LoongSpike** is a spiking sequence modeling framework that integrates fractional-order state space models (f-SSM) into spiking neural networks, enabling efficient long-range dependency modeling with sparse computation.
+**LongSpike** is a spiking sequence modeling framework that integrates fractional-order state space models (f-SSM) into spiking neural networks, enabling efficient long-range dependency modeling with sparse computation.
 
 **Key Features:**
 - **Fractional-Order Dynamics**: Replaces standard first-order Markovian transitions with fractional-order dynamics to capture long-memory effects and alleviate the memoryless bottleneck of traditional SNNs
@@ -43,7 +43,7 @@ pip install -r requirements.txt
 
 ### Training
 
-**Train LoongSpike (fractional-order):**
+**Train LongSpike (fractional-order):**
 ```bash
 # CIFAR-10 (LRA Image task)
 python -m train experiment=spikingssm/cifar
@@ -88,7 +88,7 @@ python -m train \
 ### Two Versions
 
 1. **Standard SpikingSSM** (`ss4d.py`): Integer-order baseline
-2. **LoongSpike** (`loongspike.py`): Fractional-order (our contribution)
+2. **LongSpike** (`loongspike.py`): Fractional-order (our contribution)
 
 ### Key Components
 
